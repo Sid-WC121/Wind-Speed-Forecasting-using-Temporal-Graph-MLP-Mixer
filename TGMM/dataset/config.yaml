@@ -1,0 +1,33 @@
+dataset:
+  data_path: "d:/Programming/Research/GDL/data"
+  
+  nwp_model: "ch2"
+  hours_leadtime: 96
+  window: 97  # Number of timesteps in forecast window (0 to hours_leadtime inclusive)
+  val_split: 0.20
+  test_start_date: "2024-05-16"
+  train_val_end_date: "2023-09-30"
+  target_var: "obs:wind_speed"
+  predictors:
+    - "ch2:wind_speed_ensavg"
+    - "ch2:wind_speed_ensstd"
+    - "ch2:mslp_difference_GVE_GUT_ensavg"
+    - "ch2:mslp_difference_BAS_LUG_ensavg"
+    - "time:sin_hourofday"
+    - "time:cos_hourofday"
+    - "time:sin_dayofyear"
+    - "time:cos_dayofyear"
+    - "terrain:elevation_50m"
+    - "terrain:distance_to_alpine_ridge"
+    - "terrain:tpi_2000m"
+    - "terrain:std_2000m"
+    - "terrain:valley_norm_2000m"
+    - "terrain:sn_derivative_500m"
+    - "terrain:sn_derivative_2000m"
+    - "terrain:we_derivative_500m"
+    - "terrain:we_derivative_2000m"
+    - "terrain:sn_derivative_100000m"
+  graph_kwargs:
+    knn: 5
+    threshold: 0.6
+    theta: "std"

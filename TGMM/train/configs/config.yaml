@@ -1,0 +1,72 @@
+# FALLBACK CONFIG
+project: GMM-1 # For WandB
+seed: null # Whether fix the running seed to remove randomness
+
+train:
+  batch_size: 8
+  epochs: 10 # Maximal number of epochs
+
+  # If True, missing (imputed) values are ignored when computing prediction loss
+  mask_loss: True
+
+  lr: 1e-3 # Base learning rate
+  lr_patience: 10 # number of steps before reduce learning rate
+  lr_decay: 0.5 # learning rate decay factor
+  min_lr: 1.0e-5 # A lower bound on the learning rate.
+
+  early_stop_patience: 5
+
+  monitor: valid/loss # Metric to monitor
+
+  optimizer: AdamW
+  #optimizer: EnhancedMuon
+  wd: 1e-3 # L2 regularization, weight decay (reduced from 0.2)
+
+# Optional optimizer-specific parameters (uncomment to override defaults)
+  # For EnhancedMuon optimizer:
+  # ns_iters: 5              # No of Newton-Schulz iterations (default: 5)
+  #momentum: 0.95
+  # grad_clip_norm: null     # Gradient clipping norm (default: None, set to e.g., 1.0 to enable)
+  # track_stats: false
+
+  dropout_gnn: 0.1 # Dropout rate (reduced from 0.8)
+  dropout_readout: 0.1 # Dropout rate for Readout (reduced from 0.7)
+  dropout_patch_mixer: 0.1 # Dropout rate for patch MLPMixer (reduced from 0.7)
+  dropout_node_mixer: 0.1 # Dropout rate for node MLPMixer (reduced from 0.6)
+
+model:
+  gnn_type: GINEConv # GNN type used
+  gMHA_type: MLPMixer # GraphMLPMixer or graph-based multihead attention: [MLPMixer, Hadamard, Standard, Graph, Addictive, Kernel]
+
+  add_valid_mask: True # Adds mask specifying if observation is valid (or invalid and hence imputed) to model input
+
+  nfeatures_patch: 128 # Number of features for patch mixer
+  nfeatures_node: 64 # Number of features for node mixer
+
+  nlayer_gnn: 2 # Number of gnn layers  FIXME: Check if receptive field is enough
+  nlayer_patch_mixer: 2 # Number of mlp mixer layers
+  nlayer_node_mixer: 3 # Number of mlp mixer layers
+
+  nlayer_readout: 1 # Number of mlp layers for readout
+
+  pool: mean # Pooling type for generating graph/subgraph embedding from node embeddings
+  residual: True # Use residual connection
+
+# Positional encoding options (currently not used directly, but needed for GraphPartitionTransform - TODO: Check and rm)
+pos_enc:
+  rw_dim: 16 # Random walk structural encoding
+  lap_dim: 0 # Laplacian eigenvectors positional encoding
+  patch_rw_dim: 8 # Patch random walk structural encoding
+  patch_num_diff: -1 # Patch PE diffusion steps
+
+# Metis patch extraction options
+metis:
+  enable: True # Enable Metis partition (otherwise use random partition)
+  online: False # Enable data augmentation
+  n_patches: 80 # The number of partitions
+  num_hops: 1 # expanding patches with k hop neighbourhood
+
+logging:
+  log_horizons: [3, 6, 12, "all"]
+  # if this is True the matrics `stage/all-metric` will have invalid data (present in original dataset, imputed during cleaning) ignored. Independent of this, the metrics `stage/synthRm-metric` have synthetically missing data and originally missing data (both imputed during cleaning) ignored.
+  ignore_invalid: True
