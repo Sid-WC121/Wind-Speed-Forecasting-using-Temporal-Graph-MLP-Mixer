@@ -30,4 +30,4 @@ dataset:
   graph_kwargs:
     knn: 5
     threshold: 0.6
-    theta: "std"
+    theta: "median"

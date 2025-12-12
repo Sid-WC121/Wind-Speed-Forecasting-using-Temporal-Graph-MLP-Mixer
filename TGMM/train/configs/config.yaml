@@ -4,7 +4,7 @@ seed: null # Whether fix the running seed to remove randomness
 
 train:
   batch_size: 8
-  epochs: 10 # Maximal number of epochs
+  epochs: 30 # Maximal number of epochs
 
   # If True, missing (imputed) values are ignored when computing prediction loss
   mask_loss: True
@@ -14,7 +14,7 @@ train:
   lr_decay: 0.5 # learning rate decay factor
   min_lr: 1.0e-5 # A lower bound on the learning rate.
 
-  early_stop_patience: 5
+  early_stop_patience: 10
 
   monitor: valid/loss # Metric to monitor
 

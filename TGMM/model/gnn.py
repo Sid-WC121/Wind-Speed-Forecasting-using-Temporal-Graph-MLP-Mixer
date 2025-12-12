@@ -28,7 +28,7 @@ class TransformerConv(nn.Module):
     def __init__(self, nin, nout, bias=True, nhead=8, **kwargs):
         super().__init__()
         self.layer = gnn.TransformerConv(
-            in_channels=nin, out_channels=nout//nhead, heads=nhead, edge_dim=nin, bias=bias, **kwargs)
+            in_channels=nin, out_channels=nout//nhead, heads=nhead, edge_dim=nin, bias=bias, node_dim=2, **kwargs)
 
     def reset_parameters(self):
         self.layer.reset_parameters()

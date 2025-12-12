@@ -24,7 +24,7 @@ def mask_anomalous_targets(y, min_speed, max_speed):
     return y_clean.unsqueeze(-1) if y.dim() == 4 else y_clean
 
 
-def log_prediction_plots(x, y, pred_dist, example_indices, stations, epoch, input_denormalizer, model_name="", plot_dir="."):
+def log_prediction_plots(x, y, pred_dist, example_indices, stations, epoch, input_denormalizer, model_name="", plot_dir=".", seed=None):
     x = input_denormalizer(x)  # bring inputs to their original range
     x = x.detach().cpu().numpy()
     y = y.detach().cpu().numpy()
@@ -79,8 +79,9 @@ def log_prediction_plots(x, y, pred_dist, example_indices, stations, epoch, inpu
     plt.tight_layout()
 
     os.makedirs(plot_dir, exist_ok=True)
+    seed_str = f"_seed_{seed}" if seed is not None else ""
     plot_filename = os.path.join(
-        plot_dir, f"{model_name}_predictions_epoch_{epoch}.png")
+        plot_dir, f"{model_name}_predictions_epoch_{epoch}{seed_str}.png")
     plt.savefig(plot_filename)
     plt.close(fig)
 
@@ -94,6 +95,7 @@ def plot_rank_histogram(
     n_samples: int = 20,
     horizons: list = [1, 24, 48, 96],
     plot_dir: str = ".",
+    seed=None,
 ):
     """
     model       -- your trained model (already .to(device) and with state_dict loaded)
@@ -154,10 +156,200 @@ def plot_rank_histogram(
         axs[i].set_xlim(-0.5, n_samples+0.5)
 
     plt.tight_layout()
-    outpath = os.path.join(plot_dir, "rankhist_all.png")
+    seed_str = f"_seed_{seed}" if seed is not None else ""
+    outpath = os.path.join(plot_dir, f"rankhist_all{seed_str}.png")
     fig.savefig(outpath)
     print(f"Saved rank histograms to {outpath}")
+    plt.close(fig)
 
+
+def plot_pooled_rank_histogram(
+    model,
+    dataloader: DataLoader,
+    edge_index,
+    model_name: str = "",
+    n_samples: int = 20,
+    plot_dir: str = ".",
+    seed=None,
+):
+    """
+    Compute and plot a pooled rank histogram (Talagrand diagram) 
+    over ALL lead times and ALL stations.
+    """
+    device = next(model.parameters()).device
+    model.eval()
+    if isinstance(edge_index, torch.Tensor):
+        edge_index = edge_index.to(device)
+
+    # Use incremental histogram to avoid memory issues
+    hist = torch.zeros(n_samples + 1, dtype=torch.long, device='cpu')
+
+    with torch.no_grad():
+        for batch in dataloader:
+            if len(batch) == 4:
+                x, y, valid_x, valid_y = batch
+                valid_x = valid_x.to(device)
+            else:
+                x, y = batch
+                valid_x = None
+
+            x = x.to(device)                                  # [B, L_in, N, F]
+            y = y.to(device).squeeze(-1)                      # [B, L_out, N]
+            y = mask_anomalous_targets(y, min_speed=0.2, max_speed=10.0)
+
+            if hasattr(model, "forward") and model_name != "baseline":
+                if valid_x is not None:
+                    dist = model(x, valid_x)
+                else:
+                    dist = model(x, edge_index)
+            else:
+                dist = model(x)
+
+            samp = dist.rsample((n_samples,)).squeeze(-1) 
+            
+            y_flat = y.view(-1)                          # [M]
+            samp_flat = samp.reshape(n_samples, -1)      # [n_samples, M]
+
+            mask = ~torch.isnan(y_flat)
+            y_flat = y_flat[mask]                        # [M_valid]
+            samp_flat = samp_flat[:, mask]               # [n_samples, M_valid]
+
+            if y_flat.shape[0] == 0:
+                continue
+            
+            ranks = (samp_flat < y_flat.unsqueeze(0)).sum(dim=0) 
+            
+            # Accumulate histogram incrementally (avoids storing all ranks)
+            batch_hist = torch.bincount(ranks.cpu(), minlength=n_samples + 1)
+            hist += batch_hist
+
+    total_count = hist.sum().item()
+    if total_count == 0:
+        print("No valid targets found for pooled rank histogram.")
+        return
+
+    plot_dir = os.path.join(plot_dir, model_name)
+    os.makedirs(plot_dir, exist_ok=True)
+
+    # Normalize to probability density
+    hist_normalized = hist.float() / total_count
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.bar(np.arange(n_samples + 1), hist_normalized.numpy(), width=0.8, edgecolor="k")
+    ax.set_title(f"Pooled Rank Histogram (All Leads) — {model_name}")
+    ax.set_ylabel("Probability Density")
+    ax.set_xlabel("Rank")
+    ax.set_xlim(-0.5, n_samples+0.5)
+    
+    # Plot ideal flat line
+    ax.axhline(1.0/(n_samples+1), color='r', linestyle='--', label='Ideal')
+    ax.legend()
+
+    plt.tight_layout()
+    seed_str = f"_seed_{seed}" if seed is not None else ""
+    outpath = os.path.join(plot_dir, f"rankhist_pooled{seed_str}.png")
+    fig.savefig(outpath)
+    plt.close(fig)
+    print(f"Saved pooled rank histogram to {outpath}")
+
+
+def plot_single_lead_rank_histogram(
+    model,
+    dataloader: DataLoader,
+    edge_index,
+    lead_hour: int = 1,
+    model_name: str = "",
+    n_samples: int = 20,
+    plot_dir: str = ".",
+    seed=None,
+):
+    """
+    Compute and plot a rank histogram for a SINGLE lead time with ideal line.
+    
+    Args:
+        lead_hour: The specific lead hour to plot (e.g., 1 for 1h forecast)
+    """
+    device = next(model.parameters()).device
+    model.eval()
+    if isinstance(edge_index, torch.Tensor):
+        edge_index = edge_index.to(device)
+
+    # Use incremental histogram to avoid memory issues
+    hist = torch.zeros(n_samples + 1, dtype=torch.long, device='cpu')
+
+    with torch.no_grad():
+        for batch in dataloader:
+            if len(batch) == 4:
+                x, y, valid_x, valid_y = batch
+                valid_x = valid_x.to(device)
+            else:
+                x, y = batch
+                valid_x = None
+
+            x = x.to(device)
+            y = y.to(device).squeeze(-1)  # [B, L, S]
+            y = mask_anomalous_targets(y, min_speed=0.2, max_speed=10.0)
+
+            if hasattr(model, "forward") and model_name != "baseline":
+                if valid_x is not None:
+                    dist = model(x, valid_x)
+                else:
+                    dist = model(x, edge_index)
+            else:
+                dist = model(x)
+
+            samp = dist.rsample((n_samples,)).squeeze(-1)  # [n_samples, B, L, S]
+            
+            # Extract the specific lead time
+            if lead_hour < y.shape[1]:
+                y_h = y[:, lead_hour, :]  # [B, S]
+                samp_h = samp[:, :, lead_hour, :]  # [n_samples, B, S]
+                
+                y_flat = y_h.reshape(-1)
+                samp_flat = samp_h.reshape(n_samples, -1)
+                
+                mask = ~torch.isnan(y_flat)
+                y_flat = y_flat[mask]
+                samp_flat = samp_flat[:, mask]
+                
+                if y_flat.shape[0] == 0:
+                    continue
+                
+                ranks = (samp_flat < y_flat.unsqueeze(0)).sum(dim=0)
+                batch_hist = torch.bincount(ranks.cpu(), minlength=n_samples + 1)
+                hist += batch_hist
+
+    total_count = hist.sum().item()
+    if total_count == 0:
+        print(f"No valid targets found for lead {lead_hour}h rank histogram.")
+        return
+
+    plot_dir = os.path.join(plot_dir, model_name)
+    os.makedirs(plot_dir, exist_ok=True)
+
+    # Normalize to relative frequency
+    hist_np = hist.float().numpy() / total_count
+    ranks = np.arange(n_samples + 1)  # 0..20
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.bar(ranks, hist_np, width=0.8, edgecolor='black')
+    ax.set_title(f"Rank histogram - lead t={lead_hour}h", fontsize=14)
+    ax.set_ylabel("Relative frequency", fontsize=12)
+    ax.set_xlabel("Rank", fontsize=12)
+    ax.set_xticks(ranks)
+    ax.grid(axis='y', alpha=0.3)
+    
+    # Expected uniform line
+    expected_freq = 1.0 / len(hist_np)
+    ax.axhline(y=expected_freq, color='red', linestyle='--', linewidth=2, label=f'Expected (uniform): {expected_freq:.4f}')
+    ax.legend()
+
+    plt.tight_layout()
+    seed_str = f"_seed_{seed}" if seed is not None else ""
+    outpath = os.path.join(plot_dir, f"rankhist_lead_{lead_hour}h{seed_str}.png")
+    fig.savefig(outpath, dpi=150)
+    plt.close(fig)
+    print(f"Saved {lead_hour}h lead rank histogram to {outpath}")
 
 def load_checkpoint(model, optimizer, checkpoint_path):
     checkpoint = torch.load(checkpoint_path)
@@ -170,7 +362,7 @@ def load_checkpoint(model, optimizer, checkpoint_path):
     return model, optimizer, epoch
 
 
-def plot_loss_curves(train_losses, val_losses, train_maes, val_maes, model_name="", plot_dir="."):
+def plot_loss_curves(train_losses, val_losses, train_maes, val_maes, model_name="", plot_dir=".", seed=None):
     """
     Plot training and validation loss curves (CRPS and MAE).
     
@@ -181,6 +373,7 @@ def plot_loss_curves(train_losses, val_losses, train_maes, val_maes, model_name=
         val_maes: List of validation MAE values per epoch
         model_name: Name of the model for plot title
         plot_dir: Directory to save the plot
+        seed: Random seed used for training
     """
     epochs = np.arange(1, len(train_losses) + 1)
     
@@ -205,7 +398,8 @@ def plot_loss_curves(train_losses, val_losses, train_maes, val_maes, model_name=
     plt.tight_layout()
     
     os.makedirs(plot_dir, exist_ok=True)
-    plot_filename = os.path.join(plot_dir, f"{model_name}_loss_curves.png")
+    seed_str = f"_seed_{seed}" if seed is not None else ""
+    plot_filename = os.path.join(plot_dir, f"{model_name}_loss_curves{seed_str}.png")
     plt.savefig(plot_filename, dpi=150)
     plt.close(fig)
     print(f"Saved loss curves to {plot_filename}")

@@ -13,7 +13,7 @@ from optuna.samplers import GridSampler
 from tqdm import tqdm
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
-from TGMM.utils import load_config, mask_anomalous_targets, log_prediction_plots, plot_rank_histogram, save_checkpoint, load_checkpoint, plot_loss_curves
+from TGMM.utils import load_config, mask_anomalous_targets, log_prediction_plots, plot_rank_histogram, plot_pooled_rank_histogram, plot_single_lead_rank_histogram, save_checkpoint, load_checkpoint, plot_loss_curves
 from TGMM.model.model import GMMModel
 from TGMM.model.optimizer import get_optimizer
 from TGMM.dataset.loader import load_data
@@ -34,8 +34,8 @@ def grid_space():
     return {
         # "knn" : [5, 10, 15],
         # "theta" : ["median", "factormedian", "std"],
-        # "seed" : [3,4,5],
-        "lr": [0.001, 0.0005, 0.0001]
+        "seed" : [1],
+        "lr": [0.001]
     }
 
 
@@ -44,13 +44,13 @@ def get_search_space(trial):
         "hidden_channels": 32,
         "num_layers": 2,
         "dropout_p": 0.2,
-        "lr": trial.suggest_categorical("lr", [0.001, 0.0005, 0.0001]),
+        "lr": trial.suggest_categorical("lr", [0.001]),
         "weight_decay": 1e-5,
         "scheduler": "CosineAnnealingWarmRestarts",
         "knn": 5,
         "threshold": 0.6,
-        "theta": "std",
-        "seed": 0,
+        "theta": "median",
+        "seed": trial.suggest_categorical("seed", [1]),
     }
 
     if space["scheduler"] == "onecycle":
@@ -135,6 +135,7 @@ def train_trial(cfg: DictConfig):
     epochs = cfg.train.epochs
 
     criterion = loss_prob.MaskedCRPSLogNormal()
+    
     mae_crit = loss_prob.MaskedMAE()
 
     optimizer_name = cfg.train.get('optimizer', 'AdamW')
@@ -196,12 +197,17 @@ def train_trial(cfg: DictConfig):
     print('Training started.')
     print(f"Starting {epochs} epochs of training...")
 
-    lowest_val_loss = float("inf")
     train_crps_history = []
     val_crps_history = []
     train_mae_history = []
     val_mae_history = []
     train_start_time = time.time()
+    
+    # Early stopping
+    early_stop_patience = cfg.train.get('early_stop_patience', 10)
+    best_val_loss = float('inf')
+    epochs_without_improvement = 0
+    best_model_state = None
 
     for epoch in range(epochs):
         print(f"\n{'='*50}")
@@ -265,7 +271,10 @@ def train_trial(cfg: DictConfig):
         with torch.no_grad():
             firstbatch = True
             plot_rank_histogram(model, val_dataloader, edge_index, model_name=cfg.model.type if hasattr(
-                cfg.model, 'type') else "GMMModel", plot_dir=checkpoint_dir)
+                cfg.model, 'type') else "GMMModel", plot_dir=checkpoint_dir, seed=cfg.seed)
+            
+            plot_pooled_rank_histogram(model, val_dataloader, edge_index, model_name=cfg.model.type if hasattr(
+                cfg.model, 'type') else "GMMModel", plot_dir=checkpoint_dir, seed=cfg.seed)
 
             for batch in tqdm(val_dataloader, desc=f"Epoch {epoch} Valid", leave=False, position=1):
                 if len(batch) == 4:
@@ -337,7 +346,8 @@ def train_trial(cfg: DictConfig):
                                         input_denormalizer=input_denormalizer,
                                         model_name=cfg.model.type if hasattr(
                                             cfg.model, 'type') else "GMMModel",
-                                        plot_dir=os.path.join(OUTPUTS_DIR, "plots"))
+                                        plot_dir=os.path.join(OUTPUTS_DIR, "plots"),
+                                        seed=cfg.seed)
 
         avg_val_crps = val_crps_sum / len(val_dataloader)
         avg_val_mae = val_mae_sum / len(val_dataloader)
@@ -354,9 +364,6 @@ def train_trial(cfg: DictConfig):
         print(avg_crps_h)
         print(avg_mae_h)
 
-        if avg_val_crps < lowest_val_loss:
-            lowest_val_loss = avg_val_crps
-
         print(f"\n=== Validation Metrics @ Epoch {epoch+1} ===")
         print(f"Train CRPS ", avg_train_crps)
         print(f"Train MAE ", avg_train_mae)
@@ -367,8 +374,27 @@ def train_trial(cfg: DictConfig):
         for h in [1, 24, 48, 96]:
             print(f"{h:8d} │ {avg_crps_h[h]:8.4f} │ {avg_mae_h[h]:8.4f}")
 
+        # Early stopping check
+        if avg_val_crps < best_val_loss:
+            best_val_loss = avg_val_crps
+            epochs_without_improvement = 0
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            print(f"  [New best val_loss: {best_val_loss:.4f}]")
+        else:
+            epochs_without_improvement += 1
+            print(f"  [No improvement for {epochs_without_improvement}/{early_stop_patience} epochs]")
+        
+        if epochs_without_improvement >= early_stop_patience:
+            print(f"\nEarly stopping triggered after {epoch+1} epochs")
+            break
+
         save_checkpoint(epoch, model, optimizer, checkpoint_dir,
                         name=cfg.model.type if hasattr(cfg.model, 'type') else "GMMModel")
+
+    # Restore best model if early stopping was triggered
+    if best_model_state is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_model_state.items()})
+        print(f"Restored best model (val_loss={best_val_loss:.4f})")
 
     train_end_time = time.time()
     train_duration = train_end_time - train_start_time
@@ -383,17 +409,120 @@ def train_trial(cfg: DictConfig):
         train_maes=train_mae_history,
         val_maes=val_mae_history,
         model_name=cfg.model.type if hasattr(cfg.model, 'type') else "GMMModel",
-        plot_dir=checkpoint_dir
+        plot_dir=checkpoint_dir,
+        seed=cfg.seed
     )
 
-    evaluate(cfg, model, test_dataloader, edge_index, device)  
+    test_crps, test_mae = evaluate(cfg, model, test_dataloader, edge_index, device, metadata)  
 
-    return lowest_val_loss
+    return best_val_loss, test_crps, test_mae
 
 # ——— TEST ——————————————————————————————————————
+# ----------------------------------------------------------------------------------
+# NWP feature indices (0-indexed based on dataset config predictors list)
+NWP_MEAN_IDX = 0  # ch2:wind_speed_ensavg
+NWP_STD_IDX = 1   # ch2:wind_speed_ensstd
 
 
-def evaluate(cfg: DictConfig, model, test_dataloader, edge_index, device):
+def lognormal_params_from_mean_std(mean, std, eps=1e-6):
+    """Convert mean/std on original scale to LogNormal mu/sigma parameters."""
+    mean = torch.clamp(mean, min=eps)
+    std = torch.clamp(std, min=eps)
+    variance = std ** 2
+    log_term = torch.log1p(variance / (mean ** 2))
+    mu = torch.log(mean) - 0.5 * log_term
+    sigma = torch.sqrt(torch.clamp(log_term, min=eps))
+    return mu, sigma
+
+
+def compute_nwp_baseline(dataloader, metadata, criterion, mae_crit, device, horizons=[1, 24, 48, 96]):
+    """
+    Compute NWP baseline CRPS and MAE using raw ensemble mean/std from input features.
+    
+    Returns:
+        nwp_crps: Overall NWP baseline CRPS
+        nwp_mae: Overall NWP baseline MAE
+        nwp_crps_h: Dict of per-horizon CRPS
+        nwp_mae_h: Dict of per-horizon MAE
+    """
+    input_mean = torch.tensor(metadata['input_mean'], device=device)
+    input_std = torch.tensor(metadata['input_std'], device=device)
+    
+    total_crps, total_mae, total_count = 0.0, 0.0, 0
+    sum_crps_h = {h: 0.0 for h in horizons}
+    sum_mae_h = {h: 0.0 for h in horizons}
+    count_h = {h: 0 for h in horizons}
+    
+    with torch.no_grad():
+        for batch in dataloader:
+            if len(batch) == 4:
+                x, y, _, _ = batch
+            else:
+                x, y = batch
+            
+            x = x.to(device)  # [B, L, S, F]
+            y = y.to(device)  # [B, L, S, 1] or [B, L, S]
+            
+            # Ensure y has shape [B, L, S, 1] for overall CRPS
+            if y.dim() == 3:
+                y_4d = y.unsqueeze(-1)  # [B, L, S, 1]
+            else:
+                y_4d = y  # already [B, L, S, 1]
+            
+            y_3d = y_4d.squeeze(-1)  # [B, L, S] for MAE and per-horizon
+
+            ens_mean = x[..., NWP_MEAN_IDX] * input_std[NWP_MEAN_IDX] + input_mean[NWP_MEAN_IDX]  # [B, L, S]
+            ens_std = x[..., NWP_STD_IDX] * input_std[NWP_STD_IDX] + input_mean[NWP_STD_IDX]  # [B, L, S]
+            ens_std = ens_std.clamp(min=1e-5)
+
+            nwp_mu, nwp_sigma = lognormal_params_from_mean_std(ens_mean, ens_std)
+
+            nwp_dist = torch.distributions.LogNormal(nwp_mu, nwp_sigma)
+
+            valid = ~torch.isnan(y_3d)
+            valid_count = valid.sum().item()
+            if valid_count == 0:
+                continue
+            
+            # CRPS - criterion expects y as [B, L, S, 1]
+            batch_crps = criterion(nwp_dist, y_4d).item()
+            total_crps += batch_crps * valid_count
+            # MAE (using ensemble mean directly)
+            mae_val, _ = mae_crit(ens_mean[valid], y_3d[valid])
+            total_mae += mae_val.item() * valid_count
+            total_count += valid_count
+            
+            # Per-horizon metrics
+            for h in horizons:
+                if h < y_3d.shape[1]:
+                    y_h = y_3d[:, h, :]  # [B, S]
+                    ens_mean_h = ens_mean[:, h, :]  # [B, S]
+                    nwp_mu_h = nwp_mu[:, h, :]  # [B, S]
+                    nwp_sigma_h = nwp_sigma[:, h, :]  # [B, S]
+                    
+                    valid_h = ~torch.isnan(y_h)
+                    count_valid_h = valid_h.sum().item()
+                    if count_valid_h == 0:
+                        continue
+                    
+                    # For per-horizon: y_h is [B, S] (2D), criterion expects this
+                    nwp_dist_h = torch.distributions.LogNormal(nwp_mu_h, nwp_sigma_h)
+                    crps_h = criterion(nwp_dist_h, y_h).item()
+                    mae_h, _ = mae_crit(ens_mean_h[valid_h], y_h[valid_h])
+                    
+                    sum_crps_h[h] += crps_h * count_valid_h
+                    sum_mae_h[h] += mae_h.item() * count_valid_h
+                    count_h[h] += count_valid_h
+    
+    nwp_crps = total_crps / max(total_count, 1)
+    nwp_mae = total_mae / max(total_count, 1)
+    nwp_crps_h = {h: sum_crps_h[h] / max(count_h[h], 1) for h in horizons}
+    nwp_mae_h = {h: sum_mae_h[h] / max(count_h[h], 1) for h in horizons}
+    
+    return nwp_crps, nwp_mae, nwp_crps_h, nwp_mae_h
+# ----------------------------------------------------------------------------------
+
+def evaluate(cfg: DictConfig, model, test_dataloader, edge_index, device, metadata):
     model.eval()
     test_start_time = time.time()
     print(f"\n{'='*50}")
@@ -424,7 +553,8 @@ def evaluate(cfg: DictConfig, model, test_dataloader, edge_index, device):
 
     mean_vals, std_vals = test_model(model, test_dataloader, device)
 
-    test_outputs_dir = os.path.join(OUTPUTS_DIR, 'test_outputs')
+    test_dir = os.path.join(OUTPUTS_DIR, 'test')
+    test_outputs_dir = os.path.join(test_dir, 'outputs')
     os.makedirs(test_outputs_dir, exist_ok=True)
     output_file = os.path.join(
         test_outputs_dir, f'test_outputs_{cfg.model.type if hasattr(cfg.model, "type") else "GMMModel"}_seed_{cfg.seed}.npz')
@@ -433,6 +563,12 @@ def evaluate(cfg: DictConfig, model, test_dataloader, edge_index, device):
 
     mae_crit = loss_prob.MaskedMAE()
     criterion = loss_prob.MaskedCRPSLogNormal()
+
+    # Compute NWP baseline metrics
+    print("Computing NWP baseline metrics...")
+    nwp_crps, nwp_mae, nwp_crps_h, nwp_mae_h = compute_nwp_baseline(
+        test_dataloader, metadata, criterion, mae_crit, device
+    )
 
     with torch.no_grad():
         test_mae_sum = 0.0
@@ -498,15 +634,25 @@ def evaluate(cfg: DictConfig, model, test_dataloader, edge_index, device):
         avg_test_mae = test_mae_sum / len(test_dataloader)
         
         print(f"\n=== Test Metrics ===")
-        print(f"Test CRPS  {avg_test_crps}")
-        print(f"Test MAE   {avg_test_mae}")
-        print(f" Lead(h) │     CRPS │      MAE")
-        print(f"{'─'*30}")
+        print(f"{'Metric':<12} │ {'Model':>10} │ {'NWP Baseline':>12}")
+        print(f"{'─'*40}")
+        print(f"{'CRPS':<12} │ {avg_test_crps:>10.4f} │ {nwp_crps:>12.4f}")
+        print(f"{'MAE':<12} │ {avg_test_mae:>10.4f} │ {nwp_mae:>12.4f}")
+        print(f"\n Lead(h) │ CRPS (Model) │ CRPS (NWP) │ MAE (Model) │ MAE (NWP)")
+        print(f"{'─'*65}")
         for h in [1, 24, 48, 96]:
-            print(f"{h:8d} │ {avg_crps_h[h]:8.4f} │ {avg_mae_h[h]:8.4f}")
+            print(f"{h:8d} │ {avg_crps_h[h]:12.4f} │ {nwp_crps_h[h]:10.4f} │ {avg_mae_h[h]:11.4f} │ {nwp_mae_h[h]:9.4f}")
 
         plot_rank_histogram(model, test_dataloader, edge_index, model_name=cfg.model.type if hasattr(
-            cfg.model, 'type') else "GMMModel", plot_dir=os.path.join(OUTPUTS_DIR, "rank_histograms"))
+            cfg.model, 'type') else "GMMModel", plot_dir=os.path.join(test_dir, "rank_histograms"), seed=cfg.seed)
+
+        plot_pooled_rank_histogram(model, test_dataloader, edge_index, model_name=cfg.model.type if hasattr(
+            cfg.model, 'type') else "GMMModel", plot_dir=os.path.join(test_dir, "rank_histograms"), seed=cfg.seed)
+        
+        # Single lead (1h) rank histogram with ideal line
+        plot_single_lead_rank_histogram(model, test_dataloader, edge_index, lead_hour=1, 
+            model_name=cfg.model.type if hasattr(cfg.model, 'type') else "GMMModel", 
+            plot_dir=os.path.join(test_dir, "rank_histograms"), seed=cfg.seed)
         
         print("\nGenerating test prediction plots...")
         for i, batch in enumerate(test_dataloader):
@@ -539,7 +685,8 @@ def evaluate(cfg: DictConfig, model, test_dataloader, edge_index, device):
                 epoch="test",
                 input_denormalizer=lambda x: x,
                 model_name=cfg.model.type if hasattr(cfg.model, 'type') else "GMMModel",
-                plot_dir=os.path.join(OUTPUTS_DIR, 'checkpoints', cfg.model.type if hasattr(cfg.model, 'type') else "GMMModel")
+                plot_dir=os.path.join(test_dir, 'plots'),
+                seed=cfg.seed
             )
 
         test_end_time = time.time()
@@ -549,7 +696,7 @@ def evaluate(cfg: DictConfig, model, test_dataloader, edge_index, device):
         print(f"Testing completed in {test_time_str} (HH:MM:SS)")
         print(f"{'='*50}\n")
 
-        return avg_test_crps
+        return avg_test_crps, avg_test_mae
 
 
 def set_trial(trial):
@@ -568,15 +715,33 @@ def set_trial(trial):
     search_space = get_search_space(trial)
     cfg = update_config_with_trial(cfg, search_space)
 
-    return train_trial(cfg)
+    lowest_val_loss, test_crps, test_mae = train_trial(cfg)
+    trial.set_user_attr("test_crps", test_crps)
+    trial.set_user_attr("test_mae", test_mae)
+    return lowest_val_loss
 
 
 if __name__ == '__main__':
     study_name = "TGMM_Optimization_v2" 
+    gs = grid_space()
+    n_trials = 1
+    for key in gs:
+        n_trials *= len(gs[key])
     study = optuna.create_study(
-        study_name=study_name, direction="minimize", sampler=GridSampler(grid_space()), load_if_exists=False)
+        study_name=study_name, direction="minimize", sampler=GridSampler(gs), load_if_exists=False)
 
-    study.optimize(set_trial, n_trials=1)
+    study.optimize(set_trial, n_trials=n_trials)
 
     best_trial = study.best_trial
     print(f"Best trial: {best_trial.params}")
+
+    # Aggregate metrics across all trials
+    crps_list = [t.user_attrs.get("test_crps", float('nan')) for t in study.trials]
+    mae_list = [t.user_attrs.get("test_mae", float('nan')) for t in study.trials]
+    crps_arr = np.array(crps_list)
+    mae_arr = np.array(mae_list)
+    print(f"\n{'='*50}")
+    print("Final Aggregate Metrics (across all trials):")
+    print(f"  Test CRPS: {crps_arr.mean():.4f} ± {crps_arr.std():.4f}")
+    print(f"  Test MAE:  {mae_arr.mean():.4f} ± {mae_arr.std():.4f}")
+    print(f"{'='*50}")
