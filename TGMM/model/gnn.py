@@ -57,12 +57,13 @@ class GNN(nn.Module):
 
     def forward(self, x, edge_index, edge_attr):
         previous_x = x
+        B, t, n, f = x.shape  # Cache shape for faster reshape
         for layer, norm in zip(self.convs, self.norms):
             x = layer(x, edge_index, edge_attr)
-            x = rearrange(x, 'B t n f -> (B t n) f')  # batch, nodes, features
+            # Use view instead of einops rearrange (faster, no copy)
+            x = x.reshape(-1, f)  # (B*t*n, f)
             x = norm(x)
-            x = rearrange(x, '(B t n) f -> B t n f',
-                        B=previous_x.shape[0], t=previous_x.shape[1])
+            x = x.view(B, t, n, f)  # Back to original shape
             x = F.relu(x)
             x = F.dropout(x, self.dropout, training=self.training)
             if self.res:

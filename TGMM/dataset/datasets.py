@@ -30,13 +30,13 @@ class IdentityDenormalizer:
 class XarrayDataset(Dataset):
     def __init__(self, input_data, target_data, anomalous=False):
 
-        self.input_data, self.input_denormalizer, self.input_stats = self.normalize(
+        input_np, self.input_denormalizer, self.input_stats = self.normalize(
             np.transpose(input_data.to_array().data, (1, 2, 3, 0)))
 
         # NOTE No transformation is applied to targets. If normalized ~(0,1), they can be negatve
         # which is incompatible with CRPS_LogNormal.
         if not anomalous:
-            self.target_data = np.transpose(
+            target_np = np.transpose(
                 target_data.to_array().data, (1, 2, 3, 0))
             self.target_denormalizer = IdentityDenormalizer()
         else:
@@ -44,15 +44,22 @@ class XarrayDataset(Dataset):
             # anomalous data
             raw_y = np.transpose(target_data.to_array().data, (1, 2, 3, 0))
             # mask out-of-range values
-            clean_y = self.mask_anomalous_targets(
+            target_np = self.mask_anomalous_targets(
                 torch.from_numpy(raw_y).float(),
                 min_speed=0.2,
                 max_speed=10.0
             ).numpy()  # still shape (t, l, s, 1) or (t,l,s)
 
-            self.target_data = clean_y
             self.target_denormalizer = IdentityDenormalizer()
             print("masked anomalous data")
+
+        # Pre-convert to tensors for faster __getitem__ (avoids tensor creation per call)
+        self.input_data = torch.from_numpy(input_np.copy()).float()
+        self.target_data = torch.from_numpy(target_np.copy()).float()
+        
+        # Pre-compute validity masks (True where data is valid, False where NaN)
+        self.valid_x = ~torch.isnan(self.input_data)
+        self.valid_y = ~torch.isnan(self.target_data)
 
         self.t, self.l, self.s, self.f = self.input_data.shape
         self.tg = self.target_data.shape[-1]
@@ -108,25 +115,37 @@ class XarrayDataset(Dataset):
         return self.input_data.shape[0]  # Number of forecast_reference_time
 
     def __getitem__(self, idx):
-        sample_x = self.input_data[idx]
-        sample_y = self.target_data[idx]
-
-        # Create validity masks (True where data is valid, False where NaN)
-        valid_x = ~np.isnan(sample_x)
-        valid_y = ~np.isnan(sample_y)
-
+        # Fast tensor slicing - no conversion needed
         return (
-            torch.tensor(sample_x, dtype=torch.float),
-            torch.tensor(sample_y, dtype=torch.float),
-            torch.tensor(valid_x, dtype=torch.bool),
-            torch.tensor(valid_y, dtype=torch.bool)
+            self.input_data[idx],
+            self.target_data[idx],
+            self.valid_x[idx],
+            self.valid_y[idx]
         )
 
     def __str__(self):
         return f"Dataset: [time={self.t}, lead_time={self.l}, stations={self.s}, features={self.f}] | target dim={self.tg}\n"
 
 
-def get_graph(lat, lon, knn=10, threshold=None, theta=None):
+def get_graph(lat, lon, knn=10, threshold=None, theta=None, elevation=None, sigma_h=None):
+    """
+    Construct a kNN graph with Gaussian kernel weights based on Haversine distance.
+    
+    Optionally applies terrain-aware weighting that penalizes connections across
+    major elevation barriers (Bonus 1 feature).
+    
+    Args:
+        lat: Array of latitudes for each station
+        lon: Array of longitudes for each station
+        knn: Number of nearest neighbors
+        threshold: Minimum weight threshold (edges below this are removed)
+        theta: Scale parameter for distance kernel ('std', 'median', 'factormedian', or float)
+        elevation: Optional array of elevations for each station (for terrain-aware weighting)
+        sigma_h: Scale parameter for elevation penalty (controls how strongly elevation differences are penalized)
+    
+    Returns:
+        adj: Adjacency matrix with edge weights
+    """
 
     def haversine(lat1, lon1, lat2, lon2, radius=6371):
         import math
@@ -173,6 +192,20 @@ def get_graph(lat, lon, knn=10, threshold=None, theta=None):
         return weights
 
     adj = gaussian_kernel(dist, theta)
+    
+    # Terrain-aware weighting: penalize cross-barrier connections via elevation differences
+    # w_ij = exp(-d_ij^2 / theta^2) * exp(-(h_i - h_j)^2 / sigma_h^2)
+    if elevation is not None and sigma_h is not None and sigma_h > 0:
+        print(f"Applying terrain-aware graph weighting with sigma_h={sigma_h}")
+        elevation = np.asarray(elevation)
+        # Compute pairwise elevation differences
+        elev_diff = np.abs(elevation[:, None] - elevation[None, :])
+        # Apply elevation penalty
+        elevation_penalty = np.exp(-np.square(elev_diff / sigma_h))
+        adj = adj * elevation_penalty
+        print(f"  Elevation range: {elevation.min():.1f}m to {elevation.max():.1f}m")
+        print(f"  Max elevation diff: {elev_diff.max():.1f}m")
+        print(f"  Penalty range: {elevation_penalty.min():.4f} to {elevation_penalty.max():.4f}")
 
     adj = top_k(adj, knn, include_self=True, keep_values=True)
 
@@ -290,7 +323,31 @@ def get_datamodule(ds: xr.Dataset,
     if return_graph:
         lat = ds.latitude.data
         lon = ds.longitude.data
-        adj_matrix = get_graph(lat=lat, lon=lon, **graph_kwargs)
+        
+        # Extract elevation data for terrain-aware graph weighting (Bonus 1)
+        elevation = None
+        if 'elevation_var' in graph_kwargs and graph_kwargs['elevation_var'] is not None:
+            elev_var = graph_kwargs.pop('elevation_var')
+            if elev_var in ds:
+                # Elevation is a coordinate/data variable
+                elevation = ds[elev_var].data
+                print(f"Using elevation data from '{elev_var}' for terrain-aware graph")
+            elif elev_var in ds.coords:
+                elevation = ds.coords[elev_var].data
+                print(f"Using elevation coord '{elev_var}' for terrain-aware graph")
+            else:
+                # Try to extract from first timestep of a predictor (static terrain feature)
+                for pred in predictors:
+                    if 'elevation' in pred.lower():
+                        # Get elevation from first forecast time, first lead time
+                        elev_data = ds[pred].isel(forecast_reference_time=0, lead_time=0).data
+                        elevation = elev_data
+                        print(f"Using elevation data from predictor '{pred}' for terrain-aware graph")
+                        break
+                if elevation is None:
+                    print(f"Warning: elevation_var='{elev_var}' not found in dataset, skipping terrain-aware weighting")
+        
+        adj_matrix = get_graph(lat=lat, lon=lon, elevation=elevation, **graph_kwargs)
         return PostprocessDatamodule(train_dataset=XarrayDataset(input_data=train_input_data, target_data=train_target_data, anomalous=anomalous),
                                      val_dataset=XarrayDataset(
                                          input_data=val_input_data, target_data=val_target_data, anomalous=anomalous),

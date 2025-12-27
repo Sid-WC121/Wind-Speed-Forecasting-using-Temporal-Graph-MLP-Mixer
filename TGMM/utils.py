@@ -1,6 +1,11 @@
 import os
 from omegaconf import OmegaConf
+
+# Use non-interactive backend to avoid tkinter threading issues
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -112,7 +117,7 @@ def plot_rank_histogram(
 
     ranks = {h: [] for h in horizons}
 
-    with torch.no_grad():
+    with torch.inference_mode():  # Faster than no_grad()
         for batch in dataloader:
             if len(batch) == 4:
                 x, y, valid_x, valid_y = batch
@@ -184,7 +189,7 @@ def plot_pooled_rank_histogram(
     # Use incremental histogram to avoid memory issues
     hist = torch.zeros(n_samples + 1, dtype=torch.long, device='cpu')
 
-    with torch.no_grad():
+    with torch.inference_mode():  # Faster than no_grad()
         for batch in dataloader:
             if len(batch) == 4:
                 x, y, valid_x, valid_y = batch
@@ -277,7 +282,7 @@ def plot_single_lead_rank_histogram(
     # Use incremental histogram to avoid memory issues
     hist = torch.zeros(n_samples + 1, dtype=torch.long, device='cpu')
 
-    with torch.no_grad():
+    with torch.inference_mode():  # Faster than no_grad()
         for batch in dataloader:
             if len(batch) == 4:
                 x, y, valid_x, valid_y = batch

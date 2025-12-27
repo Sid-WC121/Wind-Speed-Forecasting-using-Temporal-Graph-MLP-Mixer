@@ -28,6 +28,12 @@ dataset:
     - "terrain:we_derivative_2000m"
     - "terrain:sn_derivative_100000m"
   graph_kwargs:
-    knn: 5
-    threshold: 0.6
+    knn: 8
+    threshold: 0.4
     theta: "median"
+    # Terrain-aware graph weighting (Bonus 1)
+    # Set elevation_var to the predictor containing elevation data
+    # Set sigma_h to control elevation penalty strength (in meters)
+    # Higher sigma_h = weaker penalty, lower sigma_h = stronger penalty
+    elevation_var: "terrain:elevation_50m"  # Set to null to disable
+    sigma_h: 500  # Elevation scale in meters (typical: 200-1000m). Set to null to disable

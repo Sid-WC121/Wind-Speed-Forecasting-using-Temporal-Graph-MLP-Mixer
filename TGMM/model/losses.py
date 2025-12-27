@@ -65,7 +65,7 @@ class MaskedCRPSLogNormal(nn.Module):
 
     def __init__(self):
         super(MaskedCRPSLogNormal, self).__init__()
-        self.i = 0
+        #self.i = 0
         self.eps = 1e-5
 
     def _prepare_inputs(self, pred, y, t=None):
@@ -106,19 +106,30 @@ class MaskedCRPSLogNormal(nn.Module):
 
         y_masked = y_masked + self.eps
 
-        normal = torch.distributions.Normal(
-            torch.zeros_like(mu), torch.ones_like(sigma))
+        #normal = torch.distributions.Normal(
+        #    torch.zeros_like(mu), torch.ones_like(sigma))
 
+        # Use torch.special directly instead of creating Normal distribution
+        # ndtr(x) = CDF of standard normal = 0.5 * (1 + erf(x / sqrt(2)))
         omega = (torch.log(y_masked) - mu) / sigma
         ex_input = mu + (sigma**2) / 2
 
         ex_input = torch.clamp(ex_input, max=15)
-        self.i += 1
+        #self.i += 1
 
         ex = 2 * torch.exp(ex_input)
+        
+        #crps = y_masked * (2 * normal.cdf(omega) - 1.0) - \
+        #    ex * (normal.cdf(omega - sigma) + normal.cdf(sigma / (2**0.5)) - 1.0)
+        # Standard normal CDF using torch.special.ndtr (faster than distribution.cdf)
+        sqrt2 = 1.4142135623730951
+        inv_sqrt2 = 0.7071067811865476
+        phi_omega = torch.special.ndtr(omega)
+        phi_omega_minus_sigma = torch.special.ndtr(omega - sigma)
+        phi_sigma_over_sqrt2 = torch.special.ndtr(sigma * inv_sqrt2)
 
-        crps = y_masked * (2 * normal.cdf(omega) - 1.0) - \
-            ex * (normal.cdf(omega - sigma) + normal.cdf(sigma / (2**0.5)) - 1.0)
+        crps = y_masked * (2 * phi_omega - 1.0) - \
+            ex * (phi_omega_minus_sigma + phi_sigma_over_sqrt2 - 1.0)
 
         return crps.mean()
 
@@ -152,42 +163,51 @@ class MaskedTwCRPSLogNormal(MaskedCRPSLogNormal):
     """
     Threshold-Weighted CRPS for LogNormal distribution (Right Tail).
     Weights the CRPS by w(z) = 1{z >= threshold}.
-    Computation: CRPS_total - Integral_0_to_threshold(CRPS_integrand).
+    
+    This loss focuses on forecasting skill for values ABOVE the threshold,
+    which is useful for emphasizing performance on high wind speeds.
+    
+    Computation: twCRPS = CRPS_full - integral_0_to_threshold (F(z) - H(z-y))^2 dz
     
     Args:
-        threshold: The threshold value. Regions z >= threshold are weighted 1, z < threshold weighted 0.
+        threshold: The threshold value in ORIGINAL units (e.g., wind speed in m/s).
+                   Regions z >= threshold are weighted 1, z < threshold weighted 0.
     """
-    def __init__(self, threshold=10.0):
+    def __init__(self, threshold=5.0):
         super().__init__()
         self.threshold = float(threshold)
         self.num_integration_steps = 100
 
     def forward(self, pred, y, t=None):
-        # 1. Compute Standard CRPS (Full Domain)
-        # Using parent logic
+        # 1. Compute Standard CRPS (Full Domain) using fast ndtr implementation
         mu, sigma, y_masked = self._prepare_inputs(pred, y, t)
         y_masked = y_masked + self.eps
 
-        normal = torch.distributions.Normal(
-            torch.zeros_like(mu), torch.ones_like(sigma))
-
+        # Use fast ndtr implementation (same as parent class)
+        sqrt2 = 1.4142135623730951
+        inv_sqrt2 = 0.7071067811865476
+        
         omega = (torch.log(y_masked) - mu) / sigma
         ex_input = mu + (sigma**2) / 2
         ex_input = torch.clamp(ex_input, max=15)
-        
         ex = 2 * torch.exp(ex_input)
 
-        crps_full = y_masked * (2 * normal.cdf(omega) - 1.0) - \
-            ex * (normal.cdf(omega - sigma) + normal.cdf(sigma / (2**0.5)) - 1.0)
+        # Standard normal CDF using torch.special.ndtr (faster than distribution.cdf)
+        phi_omega = torch.special.ndtr(omega)
+        phi_omega_minus_sigma = torch.special.ndtr(omega - sigma)
+        phi_sigma_over_sqrt2 = torch.special.ndtr(sigma * inv_sqrt2)
+
+        crps_full = y_masked * (2 * phi_omega - 1.0) - \
+            ex * (phi_omega_minus_sigma + phi_sigma_over_sqrt2 - 1.0)
 
         # 2. Compute Left Tail Integral [0, threshold]
-        # twCRPS(z>=thr) = CRPS_total - CRPS(z<thr)
+        # twCRPS(z>=thr) = CRPS_full - integral_0_to_thr (F(z) - H(z-y))^2 dz
         
         if self.threshold <= 0:
             return crps_full.mean()
             
-        # Integration grid z: [Steps, 1]
-        z = torch.linspace(1e-4, self.threshold, self.num_integration_steps, device=y.device).unsqueeze(1) # [S, 1]
+        # Integration grid z: [Steps, 1] - in original units (wind speed)
+        z = torch.linspace(self.eps, self.threshold, self.num_integration_steps, device=y.device).unsqueeze(1)
         dz = z[1,0] - z[0,0]
         
         # Broadcast params: [1, M]
@@ -196,9 +216,9 @@ class MaskedTwCRPSLogNormal(MaskedCRPSLogNormal):
         y_b = y_masked.unsqueeze(0)
         
         # LogNormal CDF at z: F(z) = Phi((ln(z) - mu)/sigma)
-        # Note: z is positive (starts at 1e-4) to avoid log(0)
+        # Use ndtr for consistency
         standardized_z = (torch.log(z) - mu_b) / sigma_b
-        F_z = normal.cdf(standardized_z) # [S, M]
+        F_z = torch.special.ndtr(standardized_z)  # [S, M]
         
         # Heaviside: H(z - y) = 1 if z >= y else 0
         H_z_y = (z >= y_b).float()
@@ -206,8 +226,7 @@ class MaskedTwCRPSLogNormal(MaskedCRPSLogNormal):
         integrand = (F_z - H_z_y).pow(2)
         
         # Trapezoidal rule over z
-        # sum ( (I[:-1] + I[1:]) / 2 * dz )
-        integral = (integrand[:-1] + integrand[1:]).sum(dim=0) * (dz / 2.0) # [M]
+        integral = (integrand[:-1] + integrand[1:]).sum(dim=0) * (dz / 2.0)  # [M]
         
         tw_crps = crps_full - integral
         

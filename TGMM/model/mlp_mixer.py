@@ -84,23 +84,33 @@ class MixerBlockTemporal(nn.Module):
 
 
 class MLPMixerTemporal(nn.Module):
-    def __init__(self, n_features, n_spatial, n_timesteps, n_layer, dropout=0, with_final_norm=True):
+    def __init__(self, n_features, n_spatial, n_timesteps, n_layer, dropout=0, with_final_norm=True, skip_interval=2):
         super().__init__()
 
         self.n_spatial = n_spatial
         self.n_timesteps = n_timesteps
+        self.n_layer = n_layer
+        self.skip_interval = skip_interval  # Add skip connection every N layers
         self.with_final_norm = with_final_norm
         self.mixer_blocks = nn.ModuleList([
             MixerBlockTemporal(n_features, n_spatial, n_timesteps, n_features*2, n_spatial*2,
-                            n_timesteps*2, dropout=dropout)  # FIXME: Check what to use for hidden dims
+                            n_timesteps*2, dropout=dropout)
             for _ in range(n_layer)
         ])
         if self.with_final_norm:
             self.layer_norm = nn.LayerNorm(n_features)
 
     def forward(self, x):
-        for mixer_block in self.mixer_blocks:
+        # Skip connections: store intermediate outputs and add them back
+        residuals = []
+        for i, mixer_block in enumerate(self.mixer_blocks):
+            # Add skip connection from skip_interval layers back
+            if i >= self.skip_interval and self.skip_interval > 0:
+                x = x + residuals[i - self.skip_interval]
+            
             x = mixer_block(x)
+            residuals.append(x)
+        
         if self.with_final_norm:
             x = self.layer_norm(x)
         return x

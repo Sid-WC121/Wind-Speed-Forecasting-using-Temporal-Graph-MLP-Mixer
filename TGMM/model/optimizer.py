@@ -35,6 +35,13 @@ def get_optimizer(name: str, model_parameters, lr: float, weight_decay: float = 
     
     if hasattr(torch.optim, name):
         optimizer_cls = getattr(torch.optim, name)
+        # Use fused AdamW on CUDA for better performance
+        if name == 'AdamW' and torch.cuda.is_available():
+            try:
+                return optimizer_cls(params_list, lr=lr, weight_decay=weight_decay, fused=True, **kwargs)
+            except TypeError:
+                # fused parameter not available in older PyTorch versions
+                pass
         return optimizer_cls(params_list, lr=lr, weight_decay=weight_decay, **kwargs)
     
     if name in globals():
@@ -46,12 +53,12 @@ def get_optimizer(name: str, model_parameters, lr: float, weight_decay: float = 
 
 def create_hybrid_muon_optimizer(model_parameters, lr: float, weight_decay: float = 0.0, **kwargs):
     """
-    Create a hybrid optimizer following Muon paper recommendations:
-    - Use AdamW for: scalars (0D), vectors (1D), embeddings, and output/classifier layers
-    - Use Muon for: 2D weight matrices (except embeddings and output layers)
+    Create a hybrid optimizer that applies Muon ONLY to mixer layers:
+    - Use Muon for: 2D weight matrices in mixer layers (mixer_patch and mixer_node)
+    - Use AdamW for: everything else (GNNs, readout, encoders, biases, norms, etc.)
     
-    The function attempts to identify embedding and output layers by name patterns.
-    Common patterns: 'embed', 'embedding', 'classifier', 'head', 'fc_out', 'output', 'readout'
+    This follows the insight that MLPMixer blocks are purely dense layers,
+    making them ideal candidates for Muon's orthogonalization approach.
     
     Returns:
         A HybridOptimizer wrapper that manages both optimizers
@@ -62,12 +69,13 @@ def create_hybrid_muon_optimizer(model_parameters, lr: float, weight_decay: floa
     for name, param in model_parameters:
         name_lower = name.lower()
         
-        is_embedding = any(pattern in name_lower for pattern in 
-                          ['embed', 'embedding', 'token', 'position'])
-        is_output = any(pattern in name_lower for pattern in 
-                       ['classifier', 'head', 'fc_out', 'output', 'readout', 'mlp.layers.3'])
+        # Only apply Muon to mixer parameters (mixer_patch or mixer_node)
+        is_mixer = 'mixer' in name_lower
         
-        if len(param.shape) >= 2 and not is_embedding and not is_output:
+        # Must be 2D+ weight matrix (not bias or 1D norm params)
+        is_weight_matrix = len(param.shape) >= 2
+        
+        if is_mixer and is_weight_matrix:
             muon_params.append(param)
         else:
             adamw_params.append(param)

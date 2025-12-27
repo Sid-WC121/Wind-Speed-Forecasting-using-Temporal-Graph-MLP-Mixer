@@ -1,6 +1,7 @@
 from TGMM.model.losses import MaskedCRPSLogNormal
 import torch.nn as nn
 import torch
+import math
 from torch_scatter import scatter
 from einops import rearrange
 
@@ -10,6 +11,45 @@ from TGMM.model.gnn import GNN
 from TGMM.model.readouts import SingleNodeReadout
 from TGMM.model.utils import StaticGraphTopologyData
 from typing import Dict
+
+
+class LeadTimeEmbedding(nn.Module):
+    """
+    Learnable positional embedding for lead times.
+    Helps the model explicitly learn temporal relationships between forecast horizons.
+    """
+    def __init__(self, n_timesteps, d_model, use_sinusoidal=False):
+        super().__init__()
+        self.n_timesteps = n_timesteps
+        self.d_model = d_model
+        self.use_sinusoidal = use_sinusoidal
+        
+        if use_sinusoidal:
+            # Fixed sinusoidal embedding (like in Transformers)
+            pe = torch.zeros(n_timesteps, d_model)
+            position = torch.arange(0, n_timesteps, dtype=torch.float).unsqueeze(1)
+            div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+            pe[:, 0::2] = torch.sin(position * div_term)
+            pe[:, 1::2] = torch.cos(position * div_term[:d_model//2])  # Handle odd d_model
+            self.register_buffer('pe', pe)
+        else:
+            # Learnable embedding
+            self.embedding = nn.Embedding(n_timesteps, d_model)
+    
+    def forward(self, x):
+        """
+        x: [B, L, S, F] where L = lead times
+        Returns: x + positional embedding broadcast across batch and stations
+        """
+        B, L, S, F = x.shape
+        if self.use_sinusoidal:
+            pe = self.pe[:L, :F]  # [L, F]
+        else:
+            pos = torch.arange(L, device=x.device)
+            pe = self.embedding(pos)  # [L, F]
+        
+        # Broadcast: [L, F] -> [1, L, 1, F]
+        return x + pe.unsqueeze(0).unsqueeze(2)
 
 
 class GMMModel(nn.Module):  # Changed from LightningModule to nn.Module
@@ -57,6 +97,19 @@ class GMMModel(nn.Module):  # Changed from LightningModule to nn.Module
             dropout=cfg.train.dropout_node_mixer,
             with_final_norm=True
         )
+        
+        # Lead Time Embeddings - helps model learn temporal relationships between forecast horizons
+        self.lead_time_embed_patch = LeadTimeEmbedding(
+            n_timesteps=cfg.dataset.window,
+            d_model=cfg.model.nfeatures_patch,
+            use_sinusoidal=cfg.model.get('use_sinusoidal_pe', False)
+        )
+        self.lead_time_embed_node = LeadTimeEmbedding(
+            n_timesteps=cfg.dataset.window,
+            d_model=cfg.model.nfeatures_node,
+            use_sinusoidal=cfg.model.get('use_sinusoidal_pe', False)
+        )
+        
         self.readout = SingleNodeReadout(
             cfg.model.nfeatures_patch,
             cfg.model.nfeatures_node,
@@ -75,12 +128,16 @@ class GMMModel(nn.Module):  # Changed from LightningModule to nn.Module
         else:
             x_in = x_raw
         
-        x = rearrange(self.input_encoder_patch(x_in), 'B t n f -> B t n f')
-        nodes_x = rearrange(self.input_encoder_node(x_in),
-                            'B t n f -> B t n f')
+        x = self.input_encoder_patch(x_in)  # [B, t, n, f]
+        nodes_x = self.input_encoder_node(x_in)  # [B, t, n, f]
+        
+        # Apply lead time embeddings
+        x = self.lead_time_embed_patch(x)
+        nodes_x = self.lead_time_embed_node(nodes_x)
 
+        # Use expand instead of repeat (no memory copy, just view)
         edge_weight = self.edge_encoder(self.topo_data.edge_weight.unsqueeze(-1)).unsqueeze(
-            0).unsqueeze(0).repeat(x.shape[0], x.shape[1], 1, 1)
+            0).unsqueeze(0).expand(x.shape[0], x.shape[1], -1, -1)
 
         x = x[..., self.topo_data.subgraphs_nodes_mapper, :]
         e = edge_weight[..., self.topo_data.subgraphs_edges_mapper, :]
@@ -95,7 +152,13 @@ class GMMModel(nn.Module):  # Changed from LightningModule to nn.Module
                 x = scatter(x, self.topo_data.subgraphs_nodes_mapper, dim=-2,
                             reduce='mean')[..., self.topo_data.subgraphs_nodes_mapper, :]
             
-            x = gnn(x, edge_index, e)
+            # Use gradient checkpointing to reduce memory usage
+            if self.training and hasattr(torch.utils.checkpoint, 'checkpoint'):
+                x = torch.utils.checkpoint.checkpoint(
+                    gnn, x, edge_index, e, use_reentrant=False
+                )
+            else:
+                x = gnn(x, edge_index, e)
         
         patch_x = scatter(x, self.topo_data.subgraphs_batch,dim=-2, reduce=self.pooling)
 

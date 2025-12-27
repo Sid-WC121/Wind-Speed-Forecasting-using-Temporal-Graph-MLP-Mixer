@@ -4,6 +4,7 @@ sys.path.append(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
+from torch.utils._triton import has_triton
 import numpy as np
 import random
 import time
@@ -21,7 +22,7 @@ import TGMM.model.losses as loss_prob
 from tsl.ops.connectivity import adj_to_edge_index
 
 
-MASK_ANOM = False
+MASK_ANOM = True
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))))
@@ -39,39 +40,61 @@ def grid_space():
     }
 
 
-def get_search_space(trial):
+def get_search_space(trial, cfg):
+    """
+    Build search space from config values. 
+    The config.yaml is the single source of truth.
+    For hyperparameter search, you can use trial.suggest_* to override specific values.
+    """
+    # Handle scheduler - use default if not in config
+    if hasattr(cfg.train, 'scheduler') and hasattr(cfg.train.scheduler, 'algo'):
+        scheduler_algo = cfg.train.scheduler.algo
+        scheduler_kwargs = cfg.train.scheduler.get('kwargs', {})
+    else:
+        scheduler_algo = "CosineAnnealingWarmRestarts"
+        scheduler_kwargs = {'T_0': 10, 'T_mult': 1}
+    
     space = {
-        "hidden_channels": 32,
-        "num_layers": 2,
-        "dropout_p": 0.2,
-        "lr": trial.suggest_categorical("lr", [0.001]),
-        "weight_decay": 1e-5,
-        "scheduler": "CosineAnnealingWarmRestarts",
-        "knn": 5,
-        "threshold": 0.6,
-        "theta": "median",
-        "seed": trial.suggest_categorical("seed", [1]),
+        # Read from config - these are the defaults
+        "hidden_channels": cfg.model.nfeatures_node,
+        "nfeatures_patch": cfg.model.nfeatures_patch,
+        "num_layers": cfg.model.nlayer_gnn,
+        "dropout_p": cfg.train.get('dropout_gnn', 0.1),
+        "lr": cfg.train.lr,
+        "weight_decay": cfg.train.wd,
+        "scheduler": scheduler_algo,
+        "knn": cfg.dataset.graph_kwargs.knn,
+        "threshold": cfg.dataset.graph_kwargs.threshold,
+        "theta": cfg.dataset.graph_kwargs.theta,
+        "seed": cfg.seed if cfg.seed else 1,
     }
 
+    # Scheduler-specific kwargs from config
     if space["scheduler"] == "onecycle":
-        space["pct_start"] = 0.1
+        space["pct_start"] = scheduler_kwargs.get('pct_start', 0.1)
     elif space["scheduler"] == "CosineAnnealingWarmRestarts":
-        space["T_0"] = 10 
-        space["T_mult"] = 1  
+        space["T_0"] = scheduler_kwargs.get('T_0', 10)
+        space["T_mult"] = scheduler_kwargs.get('T_mult', 1)
     elif space["scheduler"] == "cosine":
-        space["t_max"] = 100
+        space["t_max"] = scheduler_kwargs.get('t_max', 100)
     elif space["scheduler"] == "steplr":
-        space["step_size"] = 1
-        space["step_gamma"] = 0.5
+        space["step_size"] = scheduler_kwargs.get('step_size', 1)
+        space["step_gamma"] = scheduler_kwargs.get('step_gamma', 0.5)
     else:
-        space["exp_gamma"] = 0.9564069612741963
+        space["exp_gamma"] = scheduler_kwargs.get('exp_gamma', 0.95)
     return space
 
 
 def update_config_with_trial(cfg: DictConfig, search_space):
-
+    """
+    Update config with search space values.
+    Since search_space now reads from config, this mainly handles
+    derived values and ensures consistency.
+    """
+    # These are now read directly from config via search_space, 
+    # so we only need to update derived values
     cfg.model.nfeatures_node = search_space['hidden_channels']
-    cfg.model.nfeatures_patch = search_space['hidden_channels'] * 2
+    cfg.model.nfeatures_patch = search_space['nfeatures_patch']
     cfg.model.nlayer_gnn = search_space['num_layers']
 
     if not hasattr(cfg.model, 'kwargs'):
@@ -83,12 +106,6 @@ def update_config_with_trial(cfg: DictConfig, search_space):
 
     cfg.train.lr = search_space['lr']
     cfg.train.wd = search_space['weight_decay']
-
-    if not hasattr(cfg, 'graph_kwargs'):
-        cfg.graph_kwargs = OmegaConf.create({})
-    cfg.graph_kwargs.knn = search_space['knn']
-    cfg.graph_kwargs.threshold = search_space['threshold']
-    cfg.graph_kwargs.theta = search_space['theta']
 
     cfg.seed = search_space["seed"]
 
@@ -127,6 +144,12 @@ def train_trial(cfg: DictConfig):
             torch.cuda.manual_seed_all(seed)
 
     set_seed(cfg.seed if cfg.seed else 0)
+    
+    # CUDA backend optimizations for speed
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True  # Auto-tune convolutions
+        torch.backends.cuda.matmul.allow_tf32 = True  # Faster matmuls on Ampere+
+        torch.backends.cudnn.allow_tf32 = True
 
     train_dataloader, val_dataloader, test_dataloader, topo_data, metadata = load_data(cfg)
 
@@ -134,9 +157,17 @@ def train_trial(cfg: DictConfig):
 
     epochs = cfg.train.epochs
 
-    criterion = loss_prob.MaskedCRPSLogNormal()
+    criterion = loss_prob.MaskedTwCRPSLogNormal()
     
     mae_crit = loss_prob.MaskedMAE()
+    
+    # Multi-task learning weights (CRPS + MAE)
+    # loss = alpha * CRPS + beta * MAE
+    mtl_alpha = cfg.train.get('mtl_crps_weight', 1.0)  # CRPS weight (default: 1.0)
+    mtl_beta = cfg.train.get('mtl_mae_weight', 0.0)   # MAE weight (default: 0.0 = disabled)
+    use_mtl = mtl_beta > 0
+    if use_mtl:
+        print(f"Multi-task learning enabled: loss = {mtl_alpha}*CRPS + {mtl_beta}*MAE")
 
     optimizer_name = cfg.train.get('optimizer', 'AdamW')
     optimizer_kwargs = {}
@@ -171,6 +202,18 @@ def train_trial(cfg: DictConfig):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device_type = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
+    
+    
+    # PyTorch 2.0+ compilation for faster training
+    #if hasattr(torch, 'compile') and device_type == "cuda":
+    #    print("Compiling model with torch.compile()...")
+    #    model = torch.compile(model)
+    
+    # Mixed Precision (AMP) for faster training and lower memory usage
+    use_amp = device_type == "cuda"
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp) if use_amp else None
+    if use_amp:
+        print("Using Mixed Precision (AMP) training...")
 
     for attr_name in dir(topo_data):
         if not attr_name.startswith('_'):
@@ -220,35 +263,52 @@ def train_trial(cfg: DictConfig):
         for i, batch in tqdm(enumerate(train_dataloader), desc=f"Epoch {epoch} Train", leave=False, position=1):
             if len(batch) == 4:
                 x, y, valid_x, valid_y = batch
-                valid_x = valid_x.to(device)
+                valid_x = valid_x.to(device, non_blocking=True)
             else:
                 x, y = batch
                 valid_x = None
 
-            x = x.to(device)
+            x = x.to(device, non_blocking=True)
             if MASK_ANOM:
                 y = mask_anomalous_targets(y, min_speed=0.2, max_speed=10.0)
-            y = y.to(device)
+            y = y.to(device, non_blocking=True)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)  # Faster than zero_grad()
 
-            if valid_x is not None:
-                dist = model(x, valid_x, debug=(i==0 and epoch==0))
-            else:
-                dist = model(x, edge_index, debug=(i==0 and epoch==0))
+            # Forward pass with mixed precision
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                if valid_x is not None:
+                    dist = model(x, valid_x, debug=(i==0 and epoch==0))
+                else:
+                    dist = model(x, edge_index, debug=(i==0 and epoch==0))
 
-            loss = criterion(dist, y)
+            # Loss computation in FP32 for numerical stability with LogNormal
+            crps_loss = criterion(dist, y)
 
             mu = dist.mean.squeeze(-1)
             truth = y.squeeze(-1)
             mae, _ = mae_crit(mu, truth)
+            
+            # Multi-task loss: alpha * CRPS + beta * MAE
+            if use_mtl:
+                loss = mtl_alpha * crps_loss + mtl_beta * mae
+            else:
+                loss = crps_loss
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            # Backward pass with gradient scaling
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
             lr_scheduler.step(epoch + i/len(train_dataloader))
 
-            train_crps_sum += loss.item()
+            train_crps_sum += crps_loss.item()  # Track CRPS separately for logging
             train_mae_sum += mae.item()
 
         avg_train_crps = train_crps_sum / len(train_dataloader)
@@ -268,27 +328,30 @@ def train_trial(cfg: DictConfig):
         sum_mae = {h: 0.0 for h in horizons}
         count_mae = {h: 0 for h in horizons}
 
-        with torch.no_grad():
+        with torch.inference_mode():  # Faster than no_grad()
             firstbatch = True
-            plot_rank_histogram(model, val_dataloader, edge_index, model_name=cfg.model.type if hasattr(
-                cfg.model, 'type') else "GMMModel", plot_dir=checkpoint_dir, seed=cfg.seed)
             
-            plot_pooled_rank_histogram(model, val_dataloader, edge_index, model_name=cfg.model.type if hasattr(
-                cfg.model, 'type') else "GMMModel", plot_dir=checkpoint_dir, seed=cfg.seed)
+            # Plot rank histograms every 5 epochs or on the last epoch
+            if epoch % 5 == 0:
+                plot_rank_histogram(model, val_dataloader, edge_index, model_name=cfg.model.type if hasattr(
+                    cfg.model, 'type') else "GMMModel", plot_dir=checkpoint_dir, seed=cfg.seed)
+                
+                plot_pooled_rank_histogram(model, val_dataloader, edge_index, model_name=cfg.model.type if hasattr(
+                    cfg.model, 'type') else "GMMModel", plot_dir=checkpoint_dir, seed=cfg.seed)
 
             for batch in tqdm(val_dataloader, desc=f"Epoch {epoch} Valid", leave=False, position=1):
                 if len(batch) == 4:
                     x, y, valid_x, valid_y = batch
-                    valid_x = valid_x.to(device)
+                    valid_x = valid_x.to(device, non_blocking=True)
                 else:
                     x, y = batch
                     valid_x = None
 
-                x = x.to(device)
+                x = x.to(device, non_blocking=True)
                 if MASK_ANOM:
                     y = mask_anomalous_targets(
                         y, min_speed=0.2, max_speed=10.0)
-                y = y.to(device)
+                y = y.to(device, non_blocking=True)
 
                 if valid_x is not None:
                     dist = model(x, valid_x)
@@ -712,7 +775,7 @@ def set_trial(trial):
         if not hasattr(cfg.dataset, 'horizon'):
             cfg.dataset.horizon = cfg.dataset.hours_leadtime + 1
 
-    search_space = get_search_space(trial)
+    search_space = get_search_space(trial, cfg)
     cfg = update_config_with_trial(cfg, search_space)
 
     lowest_val_loss, test_crps, test_mae = train_trial(cfg)
