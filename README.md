@@ -1,0 +1,3 @@
+- **Slides:** [Link](https://sid-wc121.github.io/assets/docs/MeteoSwiss_slides.pdf) 
+- **Report** [Link](https://sid-wc121.github.io/assets/docs/MeteoSwiss_report.pdf) 
+- **Other Models** [Link](https://github.com/edolea/GraphDL-Postprocess-USI-Project)
